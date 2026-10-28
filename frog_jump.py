@@ -1,0 +1,498 @@
+import collections
+import random
+import threading
+import time
+import numpy as np
+import pygame
+import serial
+
+# ============================================================================== 
+# SERIAL & EEG CONFIGURATION (UNO R3)
+# ============================================================================== 
+
+PORT = "COM7"          # CHANGE ONLY THIS if your UNO R3 is on another COM port
+BAUD_RATE = 115200
+
+NUM_CHANNELS = 6
+HEADER_LEN = 3
+PACKET_LEN = NUM_CHANNELS * 2 + HEADER_LEN + 1
+SYNC_BYTE_1 = 0xC7
+SYNC_BYTE_2 = 0x7C
+END_BYTE = 0x01
+SAMP_RATE = 500.0
+
+BUFFER_SIZE = int(SAMP_RATE * 2)
+eeg_data_buffer = collections.deque(maxlen=BUFFER_SIZE)
+
+serial_running = True
+current_focus_level = 50.0
+
+# ============================================================================== 
+# BLINK DETECTION - FAST / ROBUST VERSION
+# ============================================================================== 
+# The detector works on the actual stream sample-by-sample.
+# A blink is treated as a short, large excursion from a local baseline.
+# One valid blink  -> RIGHT
+# Two valid blinks -> LEFT
+# ============================================================================== 
+
+# These are intentionally adjustable if your electrode amplitude is different.
+BLINK_THRESHOLD = 45.0          # minimum ADC excursion from baseline
+BLINK_NOISE_MULT = 4.0          # adaptive noise multiplier
+BLINK_MIN_MS = 35               # blink must last at least this long
+BLINK_MAX_MS = 500              # reject very long drifts
+BLINK_RELEASE_RATIO = 0.35      # signal must fall below this fraction
+BLINK_REFRACTORY_MS = 120       # ~240 ms at 500 Hz; permits a second blink
+DOUBLE_WINDOW_MS = 900          # two valid blinks within 900 ms = LEFT
+
+# Recent samples for a local baseline.
+blink_history = collections.deque(maxlen=250)
+
+blink_active = False
+blink_start_time = 0.0
+blink_peak = 0.0
+blink_threshold_used = BLINK_THRESHOLD
+last_valid_blink_time = 0.0
+
+pending_single_blink = False
+pending_single_time = 0.0
+
+blink_action = None
+blink_lock = threading.Lock()
+
+# Diagnostic counters
+packet_count = 0
+
+
+def robust_sigma(values):
+    """Robust noise estimate using median absolute deviation."""
+    if len(values) < 20:
+        return 1.0
+    a = np.asarray(values, dtype=float)
+    med = np.median(a)
+    mad = np.median(np.abs(a - med))
+    return max(1.0, 1.4826 * mad)
+
+
+def get_blink_measurement(ch0):
+    """Return absolute deviation from a causal local baseline and threshold."""
+    blink_history.append(float(ch0))
+
+    if len(blink_history) < 100:
+        return 0.0, BLINK_THRESHOLD
+
+    a = np.asarray(blink_history, dtype=float)
+
+    # Baseline from older samples, excluding the newest ~60 ms.
+    old = a[:-30]
+    baseline = float(np.median(old))
+
+    # Noise from older samples as well.
+    sigma = robust_sigma(old)
+
+    deviation = abs(float(ch0) - baseline)
+
+    threshold = max(
+        BLINK_THRESHOLD,
+        sigma * BLINK_NOISE_MULT
+    )
+
+    return deviation, threshold
+
+
+def trigger_blink_event():
+    """Queue one blink; a second blink within 700 ms becomes LEFT."""
+    global pending_single_blink, pending_single_time, blink_action
+
+    now = time.time()
+
+    with blink_lock:
+        if pending_single_blink and (now - pending_single_time) <= (DOUBLE_WINDOW_MS / 1000.0):
+            # DOUBLE BLINK HAS ABSOLUTE PRIORITY.
+            blink_action = "LEFT"
+            pending_single_blink = False
+            pending_single_time = 0.0
+            print("*** DOUBLE BLINK -> LEFT ***")
+        else:
+            pending_single_blink = True
+            pending_single_time = now
+            print("*** BLINK -> waiting for second blink ***")
+
+
+def finalize_single_blink():
+    """Turn an unpaired blink into RIGHT after the short double-blink window."""
+    global pending_single_blink, pending_single_time, blink_action
+
+    with blink_lock:
+        if pending_single_blink and (time.time() - pending_single_time) > (DOUBLE_WINDOW_MS / 1000.0):
+            blink_action = "RIGHT"
+            pending_single_blink = False
+            pending_single_time = 0.0
+            print("*** SINGLE BLINK -> RIGHT ***")
+
+
+def process_blink_sample(ch0):
+    """Process exactly one decoded CH0 sample."""
+    global blink_active
+    global blink_start_time
+    global blink_peak
+    global blink_threshold_used
+    global last_valid_blink_time
+
+    deviation, threshold = get_blink_measurement(ch0)
+    now = time.time()
+
+    # During refractory period, don't start a new blink.
+    if not blink_active and (now - last_valid_blink_time) < (BLINK_REFRACTORY_MS / 1000.0):
+        return
+
+    if not blink_active:
+        # Start only on a genuine threshold crossing.
+        if deviation >= threshold:
+            blink_active = True
+            blink_start_time = now
+            blink_peak = deviation
+            blink_threshold_used = threshold
+            print(f"BLINK START  amp={deviation:.1f} thr={threshold:.1f}")
+        return
+
+    # Blink is active.
+    blink_peak = max(blink_peak, deviation)
+    elapsed = now - blink_start_time
+
+    # A blink ends when the signal returns near baseline.
+    release_level = max(10.0, blink_threshold_used * BLINK_RELEASE_RATIO)
+
+    if deviation <= release_level:
+        duration_ms = elapsed * 1000.0
+
+        if BLINK_MIN_MS <= duration_ms <= BLINK_MAX_MS and blink_peak >= blink_threshold_used:
+            last_valid_blink_time = now
+            trigger_blink_event()
+            print(f"BLINK VALID  duration={duration_ms:.0f}ms peak={blink_peak:.1f}")
+        else:
+            print(f"BLINK REJECTED duration={duration_ms:.0f}ms peak={blink_peak:.1f}")
+
+        blink_active = False
+        blink_start_time = 0.0
+        blink_peak = 0.0
+        blink_threshold_used = BLINK_THRESHOLD
+
+    elif elapsed * 1000.0 > BLINK_MAX_MS:
+        # Long excursion = movement/drift, not a blink.
+        print("BLINK REJECTED: too long")
+        blink_active = False
+        blink_start_time = 0.0
+        blink_peak = 0.0
+        blink_threshold_used = BLINK_THRESHOLD
+
+
+def update_focus():
+    """Keep the existing simple game focus score, independent of blink detection."""
+    global current_focus_level
+
+    if len(eeg_data_buffer) < 128:
+        return
+
+    raw_sig = np.asarray(eeg_data_buffer, dtype=float)
+    sig = raw_sig - np.mean(raw_sig)
+    rms = np.sqrt(np.mean(sig ** 2))
+
+    target_focus = np.clip((rms / 25.0) * 100.0, 0.0, 100.0)
+    current_focus_level += (target_focus - current_focus_level) * 0.08
+    current_focus_level = float(np.clip(current_focus_level, 0.0, 100.0))
+
+
+def read_eeg_serial():
+    global serial_running, packet_count
+
+    try:
+        ser = serial.Serial(PORT, BAUD_RATE, timeout=0.1)
+        time.sleep(2)
+        ser.reset_input_buffer()
+        ser.write(b"START\n")
+        print("======================================")
+        print(f"Connected to {PORT} @ {BAUD_RATE}")
+        print("Blink detector READY")
+        print("1 blink = RIGHT | 2 blinks = LEFT")
+        print("======================================")
+    except Exception as e:
+        print(f"Serial port offline ({e}). Keyboard test mode active (Keys 1 & 2).")
+        return
+
+    buffer = bytearray()
+    last_status = time.time()
+
+    while serial_running:
+        try:
+            if ser.in_waiting:
+                buffer.extend(ser.read(ser.in_waiting))
+
+                while len(buffer) >= PACKET_LEN:
+                    if buffer[0] == SYNC_BYTE_1 and buffer[1] == SYNC_BYTE_2:
+                        if buffer[PACKET_LEN - 1] == END_BYTE:
+                            packet = bytes(buffer[:PACKET_LEN])
+                            del buffer[:PACKET_LEN]
+
+                            idx = HEADER_LEN
+                            ch0 = (packet[idx] << 8) | packet[idx + 1]
+                            eeg_data_buffer.append(ch0)
+                            packet_count += 1
+
+                            # THIS is the important part: every valid sample goes
+                            # directly into the blink detector.
+                            process_blink_sample(ch0)
+                        else:
+                            del buffer[0]
+                    else:
+                        del buffer[0]
+
+            finalize_single_blink()
+            update_focus()
+
+            if time.time() - last_status > 1.0:
+                latest = eeg_data_buffer[-1] if eeg_data_buffer else 0
+                print(f"Packets={packet_count}  CH0={latest}  Focus={current_focus_level:.1f}%")
+                last_status = time.time()
+
+            time.sleep(0.001)
+
+        except Exception as e:
+            print("Serial processing error:", e)
+            break
+
+    try:
+        if ser.is_open:
+            ser.write(b"STOP\n")
+            ser.close()
+    except Exception:
+        pass
+
+
+serial_thread = threading.Thread(target=read_eeg_serial, daemon=True)
+serial_thread.start()
+
+# ==============================================================================
+# PYGAME GRAPHICS & GAME ENGINE
+# ==============================================================================
+pygame.init()
+
+WIDTH, HEIGHT = 800, 900
+screen = pygame.display.set_mode((WIDTH, HEIGHT))
+pygame.display.set_caption("🐸 Brain Frog - Restartable Jump")
+clock = pygame.time.Clock()
+
+SKY_BLUE = (160, 215, 250)
+WHITE = (255, 255, 255)
+BLACK = (0, 0, 0)
+GREEN = (60, 190, 60)
+BELLY = (190, 255, 180)
+PAD_GREEN = (30, 140, 50)
+FLOWER_RED = (230, 70, 80)
+DARK_OVERLAY = (0, 0, 0, 180)
+
+font = pygame.font.SysFont("arial", 24, True)
+big_font = pygame.font.SysFont("arial", 48, True)
+
+
+class LilyPad:
+    def __init__(self, x, y, width=120):
+        self.rect = pygame.Rect(x, y, width, 20)
+        self.has_flower = random.random() < 0.3
+
+    def draw(self, surface):
+        pygame.draw.ellipse(surface, PAD_GREEN, self.rect)
+        notch = (self.rect.centerx, self.rect.top, 15, 10)
+        pygame.draw.ellipse(surface, SKY_BLUE, notch)
+        if self.has_flower:
+            pygame.draw.circle(
+                surface, FLOWER_RED, (self.rect.centerx, self.rect.top - 4), 6
+            )
+
+
+def draw_frog(x, y):
+    pygame.draw.ellipse(screen, GREEN, (x, y, 50, 40))
+    pygame.draw.ellipse(screen, BELLY, (x + 10, y + 10, 30, 22))
+    # Eyes
+    pygame.draw.circle(screen, GREEN, (x + 14, y - 5), 8)
+    pygame.draw.circle(screen, GREEN, (x + 36, y - 5), 8)
+    pygame.draw.circle(screen, WHITE, (x + 14, y - 5), 5)
+    pygame.draw.circle(screen, WHITE, (x + 36, y - 5), 5)
+    pygame.draw.circle(screen, BLACK, (x + 14, y - 5), 2)
+    pygame.draw.circle(screen, BLACK, (x + 36, y - 5), 2)
+
+
+# ==============================================================================
+# GAME RESET FUNCTION
+# ==============================================================================
+def reset_game():
+    global frog_rect, target_x, vel_y, gravity, max_height, game_over, platforms
+    frog_rect = pygame.Rect(WIDTH // 2 - 25, HEIGHT - 150, 50, 40)
+    target_x = frog_rect.x
+    vel_y = 0
+    gravity = 0.6
+    max_height = 0
+    game_over = False
+
+    platforms = [LilyPad(WIDTH // 2 - 60, HEIGHT - 100, 140)]
+    for i in range(1, 10):
+        px = random.randint(50, WIDTH - 170)
+        py = HEIGHT - 100 - (i * 90)
+        platforms.append(LilyPad(px, py))
+
+
+reset_game()
+running = True
+
+# ==============================================================================
+# MAIN GAME LOOP
+# ==============================================================================
+while running:
+    dt = clock.tick(60) / 1000.0
+
+    for event in pygame.event.get():
+        if event.type == pygame.QUIT:
+            running = False
+        elif event.type == pygame.KEYDOWN:
+            if game_over:
+                if event.key == pygame.K_r:
+                    reset_game()
+                elif event.key == pygame.K_ESCAPE:
+                    running = False
+            else:
+                if event.key == pygame.K_ESCAPE:
+                    running = False
+
+    keys = pygame.key.get_pressed()
+
+    # Manual keyboard testing overrides
+    if keys[pygame.K_UP]:
+        focus = min(100.0, current_focus_level + 25.0)
+    else:
+        focus = current_focus_level
+
+    if not game_over:
+        if keys[pygame.K_1]:
+            blink_action = "RIGHT"
+        elif keys[pygame.K_2]:
+            blink_action = "LEFT"
+
+        # Consume Blink Commands
+        if blink_action == "RIGHT":
+            target_x += 120
+            blink_action = None
+        elif blink_action == "LEFT":
+            target_x -= 120
+            blink_action = None
+
+        # Smooth horizontal movement
+        frog_rect.x += int((target_x - frog_rect.x) * 0.25)
+
+        # Wrap around screen boundaries
+        if frog_rect.right < 0:
+            frog_rect.left = WIDTH
+            target_x = frog_rect.x
+        elif frog_rect.left > WIDTH:
+            frog_rect.right = 0
+            target_x = frog_rect.x
+
+        # Physics
+        vel_y += gravity
+        frog_rect.y += int(vel_y)
+
+        # Platform Collisions
+        if vel_y > 0:
+            for p in platforms:
+                if p.rect.colliderect(frog_rect) and (
+                    frog_rect.bottom <= p.rect.bottom + 10
+                ):
+                    if focus >= 60.0:
+                        jump_strength = -14.0 - ((focus - 60.0) / 40.0) * 6.0
+                    elif focus >= 30.0:
+                        jump_strength = -11.0
+                    else:
+                        jump_strength = -6.0
+
+                    vel_y = jump_strength
+                    break
+
+        # Camera Elevation
+        if frog_rect.top < HEIGHT // 2:
+            scroll = HEIGHT // 2 - frog_rect.top
+            frog_rect.top = HEIGHT // 2
+            max_height += scroll
+            for p in platforms:
+                p.rect.y += scroll
+
+        # Recycle Lily Pads
+        for p in platforms:
+            if p.rect.top > HEIGHT:
+                p.rect.y = min([plat.rect.y for plat in platforms]) - random.randint(75, 100)
+                p.rect.x = random.randint(50, WIDTH - 170)
+
+        # Fall Off Screen -> Trigger Game Over Menu
+        if frog_rect.top > HEIGHT:
+            game_over = True
+
+    # --------------------------------------------------------------------------
+    # RENDER SCENE
+    # --------------------------------------------------------------------------
+    screen.fill(SKY_BLUE)
+
+    for p in platforms:
+        p.draw(screen)
+
+    if not game_over:
+        draw_frog(frog_rect.x, frog_rect.y)
+
+    # Focus Gauge UI
+    pygame.draw.rect(screen, (30, 30, 30), (20, 20, 260, 26), border_radius=6)
+    bar_color = (
+        (220, 60, 60)
+        if focus < 35
+        else ((240, 200, 50) if focus < 60 else (80, 220, 80))
+    )
+    pygame.draw.rect(
+        screen, bar_color, (23, 23, int(focus * 2.54), 20), border_radius=6
+    )
+
+    screen.blit(font.render(f"Focus: {int(focus)}%", True, BLACK), (20, 52))
+    screen.blit(
+        font.render("1 Blink: RIGHT | 2 Blinks: LEFT", True, (0, 70, 150)),
+        (20, 85),
+    )
+
+    alt_m = int(max_height / 10)
+    screen.blit(
+        font.render(f"Altitude: {alt_m} m", True, BLACK), (WIDTH - 180, 20)
+    )
+
+    # --------------------------------------------------------------------------
+    # GAME OVER OVERLAY MENU
+    # --------------------------------------------------------------------------
+    if game_over:
+        # Dark transparent backdrop
+        overlay = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
+        overlay.fill(DARK_OVERLAY)
+        screen.blit(overlay, (0, 0))
+
+        # Menu Window Box
+        menu_rect = pygame.Rect(WIDTH // 2 - 200, HEIGHT // 2 - 140, 400, 280)
+        pygame.draw.rect(screen, (240, 245, 250), menu_rect, border_radius=16)
+        pygame.draw.rect(screen, (50, 60, 80), menu_rect, width=4, border_radius=16)
+
+        # Menu Text
+        title = big_font.render("FROG FELL!", True, (200, 40, 40))
+        score_txt = font.render(f"Final Altitude: {alt_m} meters", True, BLACK)
+        restart_txt = font.render("Press  'R'  to Play Again", True, (0, 120, 50))
+        exit_txt = font.render("Press  'ESC'  to Exit", True, (100, 100, 100))
+
+        screen.blit(title, (WIDTH // 2 - title.get_width() // 2, HEIGHT // 2 - 110))
+        screen.blit(score_txt, (WIDTH // 2 - score_txt.get_width() // 2, HEIGHT // 2 - 40))
+        screen.blit(restart_txt, (WIDTH // 2 - restart_txt.get_width() // 2, HEIGHT // 2 + 30))
+        screen.blit(exit_txt, (WIDTH // 2 - exit_txt.get_width() // 2, HEIGHT // 2 + 75))
+
+    pygame.display.flip()
+
+serial_running = False
+pygame.quit()
